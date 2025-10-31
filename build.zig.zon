@@ -1,0 +1,20 @@
+.{
+    .name = .libpq_zig,
+    .version = "0.0.0",
+    .fingerprint = 0xeda2929b0d1331b1, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .libpq = .{
+            .url = "https://github.com/allyourcodebase/libpq/archive/refs/tags/5.16.4+4.zip",
+            .hash = "libpq-5.16.4-QME6aW36AADOlwgzNjKYsIb6YAesA6R7OV_eP7S7JBqt",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        // For example...
+        //"LICENSE",
+        //"README.md",
+    },
+}

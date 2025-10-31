@@ -130,7 +130,7 @@ pub const Row = struct {
     row_index: i32,
     allocator: std.mem.Allocator,
 
-    pub fn get(self: *@This(), column: []const u8, comptime T: type) !T {
+    pub fn get(self: *const @This(), column: []const u8, comptime T: type) !T {
         const col_index = libpq.PQfnumber(self.result, column.ptr);
         if (col_index == -1) return PostgresError.NoSuchColumn;
 
@@ -142,7 +142,7 @@ pub const Row = struct {
         return parseValue(T, std.mem.span(value));
     }
 
-    pub fn getOpt(self: *@This(), column: []const u8, comptime T: type) !?T {
+    pub fn getOpt(self: *const @This(), column: []const u8, comptime T: type) !?T {
         const col_index = libpq.PQfnumber(self.result, column.ptr);
         if (col_index == -1) return PostgresError.NoSuchColumn;
 
@@ -151,7 +151,8 @@ pub const Row = struct {
         }
 
         const value = libpq.PQgetvalue(self.result, self.row_index, col_index);
-        return parseValue(T, std.mem.span(value));
+        const ret = try parseValue(T, std.mem.span(value));
+        return ret;
     }
 };
 
@@ -196,31 +197,31 @@ pub const QueryBuilder = struct {
 
     pub fn init(allocator: std.mem.Allocator) QueryBuilder {
         return QueryBuilder{
-            .query = std.ArrayList(u8).init(allocator),
-            .params = std.ArrayList([]const u8).init(allocator),
+            .query = .empty,
+            .params = .empty,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *@This()) void {
-        self.query.deinit();
+        self.query.deinit(self.allocator);
         for (self.params.items) |param| {
             self.allocator.free(param);
         }
-        self.params.deinit();
+        self.params.deinit(self.allocator);
     }
 
     pub fn sql(self: *@This(), text: []const u8) !*@This() {
-        try self.query.appendSlice(text);
+        try self.query.appendSlice(self.allocator, text);
         return self;
     }
 
     pub fn bind(self: *@This(), value: anytype) !*@This() {
         const param_index = self.params.items.len + 1;
-        try self.query.writer().print("${d}", .{param_index});
+        try self.query.writer(self.allocator).print("${d}", .{param_index});
 
         const str_value = try valueToString(self.allocator, value);
-        try self.params.append(str_value);
+        try self.params.append(self.allocator, str_value);
         return self;
     }
 
@@ -230,26 +231,123 @@ pub const QueryBuilder = struct {
 };
 
 fn parseValue(comptime T: type, value: []const u8) !T {
-    switch (T) {
-        i16 => return std.fmt.parseInt(i16, value, 10),
-        i32 => return std.fmt.parseInt(i32, value, 10),
-        i64 => return std.fmt.parseInt(i64, value, 10),
-        f32 => return std.fmt.parseFloat(f32, value),
-        f64 => return std.fmt.parseFloat(f64, value),
-        bool => return std.mem.eql(u8, value, "t") or std.mem.eql(u8, value, "true"),
-        []const u8 => return value,
-        else => @compileError("Unsupported type for parseValue: " ++ @typeName(T)),
+    const type_info = @typeInfo(T);
+
+    switch (type_info) {
+        .int => {
+            return std.fmt.parseInt(T, value, 10);
+        },
+        .float => {
+            return std.fmt.parseFloat(T, value);
+        },
+        .bool => {
+            return std.mem.eql(u8, value, "t") or std.mem.eql(u8, value, "true");
+        },
+        .pointer => |ptr_info| {
+            switch (ptr_info.size) {
+                .slice => {
+                    if (ptr_info.child == u8) {
+                        // Handle []const u8, []u8
+                        return value;
+                    }
+                },
+                else => {},
+            }
+        },
+        .array => |array_info| {
+            if (array_info.child == u8) {
+                // Handle [N]u8, [N:0]u8 - but this requires copying into a fixed array
+                // For now, we'll return an error as we can't safely convert
+                @compileError("Cannot parse into fixed-size array type " ++ @typeName(T) ++ ". Use []const u8 instead.");
+            }
+        },
+        else => {},
     }
+
+    @compileError("Unsupported type for parseValue: " ++ @typeName(T));
 }
 
 fn valueToString(allocator: std.mem.Allocator, value: anytype) ![]const u8 {
     const T = @TypeOf(value);
-    switch (T) {
-        i16, i32, i64 => return std.fmt.allocPrint(allocator, "{d}", .{value}),
-        f32, f64 => return std.fmt.allocPrint(allocator, "{d}", .{value}),
-        bool => return allocator.dupe(u8, if (value) "true" else "false"),
-        []const u8 => return allocator.dupe(u8, value),
-        else => @compileError("Unsupported type for valueToString: " ++ @typeName(T)),
+    const type_info = @typeInfo(T);
+
+    switch (type_info) {
+        .int => return std.fmt.allocPrint(allocator, "{d}", .{value}),
+        .float => return std.fmt.allocPrint(allocator, "{d}", .{value}),
+        .bool => return allocator.dupe(u8, if (value) "true" else "false"),
+        .pointer => |ptr_info| {
+            switch (ptr_info.size) {
+                .one => {
+                    // Handle *const [N:0]u8, *const [N]u8, etc.
+                    const child_info = @typeInfo(ptr_info.child);
+                    if (child_info == .array) {
+                        const array_info = child_info.array;
+                        if (array_info.child == u8) {
+                            // Convert array pointer to slice
+                            const slice: []const u8 = value;
+                            return allocator.dupe(u8, slice);
+                        }
+                    }
+                    return std.fmt.allocPrint(allocator, "{any}", .{value});
+                },
+                .many => {
+                    if (ptr_info.child == u8) {
+                        // Handle [*:0]const u8, [*]const u8
+                        if (std.builtin.Type.Pointer.sentinel(ptr_info)) |sentinel| {
+                            if (sentinel == 0) {
+                                // Null-terminated string
+                                const slice = std.mem.span(value);
+                                return allocator.dupe(u8, slice);
+                            }
+                        }
+                        // For non-null-terminated, we can't safely determine length
+                        return std.fmt.allocPrint(allocator, "{any}", .{value});
+                    }
+                    return std.fmt.allocPrint(allocator, "{any}", .{value});
+                },
+                .slice => {
+                    if (ptr_info.child == u8) {
+                        // Handle []u8, []const u8
+                        return allocator.dupe(u8, value);
+                    }
+                    return std.fmt.allocPrint(allocator, "{any}", .{value});
+                },
+                .c => {
+                    if (ptr_info.child == u8) {
+                        // Handle [*c]const u8
+                        const slice = std.mem.span(value);
+                        return allocator.dupe(u8, slice);
+                    }
+                    return std.fmt.allocPrint(allocator, "{any}", .{value});
+                },
+            }
+        },
+        .array => |array_info| {
+            if (array_info.child == u8) {
+                // Handle [N]u8, [N:0]u8
+                const slice: []const u8 = &value;
+                if (std.builtin.Type.Array.sentinel(array_info)) |sentinel| {
+                    if (sentinel == 0) {
+                        // Null-terminated array, find actual length
+                        const len = std.mem.indexOfScalar(u8, slice, 0) orelse slice.len;
+                        return allocator.dupe(u8, slice[0..len]);
+                    }
+                }
+                return allocator.dupe(u8, slice);
+            }
+            return std.fmt.allocPrint(allocator, "{any}", .{value});
+        },
+        .optional => {
+            if (value) |val| {
+                return valueToString(allocator, val);
+            } else {
+                return allocator.dupe(u8, "null");
+            }
+        },
+        else => {
+            // Fallback for other types
+            return std.fmt.allocPrint(allocator, "{any}", .{value});
+        },
     }
 }
 
@@ -264,8 +362,8 @@ pub const ConnectionPool = struct {
 
     pub fn init(allocator: std.mem.Allocator, connection_string: []const u8, min_connections: u32, max_connections: u32) !ConnectionPool {
         var pool = ConnectionPool{
-            .connections = std.ArrayList(*Connection).init(allocator),
-            .available = std.ArrayList(*Connection).init(allocator),
+            .connections = try .initCapacity(allocator, max_connections),
+            .available = try .initCapacity(allocator, max_connections),
             .mutex = std.Thread.Mutex{},
             .max_connections = max_connections,
             .min_connections = min_connections,
@@ -278,8 +376,8 @@ pub const ConnectionPool = struct {
             const conn = try allocator.create(Connection);
             conn.* = Connection.init(allocator);
             try conn.connect(connection_string);
-            try pool.connections.append(conn);
-            try pool.available.append(conn);
+            try pool.connections.append(allocator, conn);
+            try pool.available.append(allocator, conn);
         }
 
         return pool;
@@ -290,8 +388,8 @@ pub const ConnectionPool = struct {
             conn.deinit();
             self.allocator.destroy(conn);
         }
-        self.connections.deinit();
-        self.available.deinit();
+        self.connections.deinit(self.allocator);
+        self.available.deinit(self.allocator);
         self.allocator.free(self.connection_string);
     }
 
@@ -300,14 +398,14 @@ pub const ConnectionPool = struct {
         defer self.mutex.unlock();
 
         if (self.available.items.len > 0) {
-            return self.available.pop();
+            return self.available.pop().?;
         }
 
         if (self.connections.items.len < self.max_connections) {
             const conn = try self.allocator.create(Connection);
             conn.* = Connection.init(self.allocator);
             try conn.connect(self.connection_string);
-            try self.connections.append(conn);
+            try self.connections.append(self.allocator, conn);
             return conn;
         }
 
@@ -317,7 +415,7 @@ pub const ConnectionPool = struct {
     pub fn release(self: *@This(), conn: *Connection) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.available.append(conn) catch {};
+        self.available.append(self.allocator, conn) catch {};
     }
 };
 
@@ -424,7 +522,7 @@ pub const Connection = struct {
             return PostgresError.QueryFailed;
         }
 
-        return ResultSet.init(result, self.allocator);
+        return ResultSet.init(result.?, self.allocator);
     }
 
     // Prepared statements
@@ -451,7 +549,7 @@ pub const Connection = struct {
         if (self.pq == null) return PostgresError.ConnectionFailed;
 
         // Convert params to the format libpq expects
-        var param_values: []const [*c]const u8 = undefined;
+        var param_values: [][*c]const u8 = undefined;
         if (params.len > 0) {
             param_values = try self.allocator.alloc([*c]const u8, params.len);
             defer self.allocator.free(param_values);
@@ -478,7 +576,7 @@ pub const Connection = struct {
             return PostgresError.QueryFailed;
         }
 
-        return ResultSet.init(result, self.allocator);
+        return ResultSet.init(result.?, self.allocator);
     }
 
     // Transaction management
@@ -577,12 +675,23 @@ pub const Connection = struct {
             .hint = "",
         };
 
+        // Helper function to safely convert C strings with fallback
+        const getErrorField = struct {
+            fn call(ptr: ?[*c]u8, fallback: []const u8) []const u8 {
+                if (ptr) |p| {
+                    return std.mem.span(p);
+                } else {
+                    return fallback;
+                }
+            }
+        }.call;
+
         return PostgresErrorInfo{
-            .message = std.mem.span(libpq.PQresultErrorMessage(self.last_result) orelse "Unknown error"),
-            .sqlstate = std.mem.span(libpq.PQresultErrorField(self.last_result, libpq.PG_DIAG_SQLSTATE) orelse ""),
-            .severity = std.mem.span(libpq.PQresultErrorField(self.last_result, libpq.PG_DIAG_SEVERITY) orelse ""),
-            .detail = std.mem.span(libpq.PQresultErrorField(self.last_result, libpq.PG_DIAG_MESSAGE_DETAIL) orelse ""),
-            .hint = std.mem.span(libpq.PQresultErrorField(self.last_result, libpq.PG_DIAG_MESSAGE_HINT) orelse ""),
+            .message = getErrorField(libpq.PQresultErrorMessage(self.last_result), "Unknown error"),
+            .sqlstate = getErrorField(libpq.PQresultErrorField(self.last_result, libpq.PG_DIAG_SQLSTATE), ""),
+            .severity = getErrorField(libpq.PQresultErrorField(self.last_result, libpq.PG_DIAG_SEVERITY), ""),
+            .detail = getErrorField(libpq.PQresultErrorField(self.last_result, libpq.PG_DIAG_MESSAGE_DETAIL), ""),
+            .hint = getErrorField(libpq.PQresultErrorField(self.last_result, libpq.PG_DIAG_MESSAGE_HINT), ""),
         };
     }
 
@@ -920,4 +1029,654 @@ test "libpq wrapper API" {
     try conn.connect(connection_string);
 
     std.debug.print("PSQL Server version: {} \n", .{conn.serverVersion()});
+}
+
+test "connection string creation" {
+    const allocator = std.testing.allocator;
+
+    const conn_str = try createConnectionString(allocator, "localhost", 5432, "testdb", "testuser", "testpass");
+    defer allocator.free(conn_str);
+
+    const expected = "host=localhost port=5432 dbname=testdb user=testuser password=testpass";
+    try std.testing.expectEqualStrings(expected, conn_str);
+}
+
+test "UUID parsing and formatting" {
+    const allocator = std.testing.allocator;
+
+    // Test UUID parsing
+    const uuid_str = "550e8400-e29b-41d4-a716-446655440000";
+    const uuid_bytes = try parseUUID(uuid_str);
+
+    // Test UUID formatting
+    const formatted = try formatUUID(uuid_bytes, allocator);
+    defer allocator.free(formatted);
+
+    try std.testing.expectEqualStrings(uuid_str, formatted);
+}
+
+test "UUID parsing errors" {
+    // Test invalid UUID length
+    try std.testing.expectError(PostgresError.TypeMismatch, parseUUID("invalid"));
+
+    // Test invalid hex characters
+    try std.testing.expectError(PostgresError.TypeMismatch, parseUUID("gggggggg-gggg-gggg-gggg-gggggggggggg"));
+}
+
+test "PgType value parsing" {
+    // Test integer parsing
+    try std.testing.expectEqual(@as(i32, 42), try parseValue(i32, "42"));
+    try std.testing.expectEqual(@as(i64, -123), try parseValue(i64, "-123"));
+    try std.testing.expectEqual(@as(i16, 999), try parseValue(i16, "999"));
+
+    // Test float parsing
+    try std.testing.expectEqual(@as(f32, 3.14), try parseValue(f32, "3.14"));
+    try std.testing.expectEqual(@as(f64, -2.71), try parseValue(f64, "-2.71"));
+
+    // Test boolean parsing
+    try std.testing.expectEqual(true, try parseValue(bool, "t"));
+    try std.testing.expectEqual(true, try parseValue(bool, "true"));
+    try std.testing.expectEqual(false, try parseValue(bool, "f"));
+    try std.testing.expectEqual(false, try parseValue(bool, "false"));
+
+    // Test string parsing
+    try std.testing.expectEqualStrings("hello", try parseValue([]const u8, "hello"));
+}
+
+test "value to string conversion" {
+    const allocator = std.testing.allocator;
+
+    // Test integer conversion
+    {
+        const result = try valueToString(allocator, @as(i32, 42));
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("42", result);
+    }
+
+    // Test float conversion
+    {
+        const result = try valueToString(allocator, @as(f32, 3.14));
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("3.14", result);
+    }
+
+    // Test boolean conversion
+    {
+        const result_true = try valueToString(allocator, true);
+        defer allocator.free(result_true);
+        try std.testing.expectEqualStrings("true", result_true);
+
+        const result_false = try valueToString(allocator, false);
+        defer allocator.free(result_false);
+        try std.testing.expectEqualStrings("false", result_false);
+    }
+
+    // Test slice string conversion
+    {
+        const result = try valueToString(allocator, @as([]const u8, "hello world"));
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("hello world", result);
+    }
+
+    // Test comptime string literal (array) conversion
+    {
+        const comptime_str = "hello";
+        const result = try valueToString(allocator, comptime_str);
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("hello", result);
+    }
+
+    // Test null-terminated array conversion
+    {
+        const null_term_array: [6:0]u8 = "hello\x00".*;
+        const result = try valueToString(allocator, null_term_array);
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("hello", result);
+    }
+
+    // Test pointer to null-terminated array
+    {
+        const str = "hello";
+        const ptr: *const [5:0]u8 = str;
+        const result = try valueToString(allocator, ptr);
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("hello", result);
+    }
+
+    // Test null-terminated pointer
+    {
+        const str = "hello";
+        const ptr: [*:0]const u8 = str.ptr;
+        const result = try valueToString(allocator, ptr);
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("hello", result);
+    }
+
+    // Test C pointer
+    {
+        const str = "hello";
+        const c_ptr: [*c]const u8 = str.ptr;
+        const result = try valueToString(allocator, c_ptr);
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("hello", result);
+    }
+
+    // Test optional values
+    {
+        const opt_val: ?i32 = 42;
+        const result = try valueToString(allocator, opt_val);
+        defer allocator.free(result);
+        try std.testing.expectEqualStrings("42", result);
+
+        const null_val: ?i32 = null;
+        const result_null = try valueToString(allocator, null_val);
+        defer allocator.free(result_null);
+        try std.testing.expectEqualStrings("null", result_null);
+    }
+}
+
+test "query builder" {
+    const allocator = std.testing.allocator;
+
+    var builder = QueryBuilder.init(allocator);
+    defer builder.deinit();
+
+    _ = try builder.sql("SELECT name, age FROM users WHERE age > ");
+    _ = try builder.bind(@as(i32, 18));
+    _ = try builder.sql(" AND active = ");
+    _ = try builder.bind(true);
+    _ = try builder.sql(" AND city = ");
+    _ = try builder.bind("New York");
+
+    const query = builder.build();
+    try std.testing.expectEqualStrings("SELECT name, age FROM users WHERE age > $1 AND active = $2 AND city = $3", query);
+
+    // Check that parameters are correctly stored
+    try std.testing.expectEqual(@as(usize, 3), builder.params.items.len);
+    try std.testing.expectEqualStrings("18", builder.params.items[0]);
+    try std.testing.expectEqualStrings("true", builder.params.items[1]);
+    try std.testing.expectEqualStrings("New York", builder.params.items[2]);
+}
+
+test "connection metrics" {
+    var metrics = ConnectionMetrics.init();
+
+    // Initially should have no queries
+    try std.testing.expectEqual(@as(u64, 0), metrics.total_queries);
+    try std.testing.expectEqual(@as(f64, 0.0), metrics.getSuccessRate());
+    try std.testing.expectEqual(@as(f64, 0.0), metrics.getAverageQueryTime());
+
+    // Record some successful queries
+    metrics.recordQuery(true, 100);
+    metrics.recordQuery(true, 200);
+    metrics.recordQuery(false, 50);
+
+    try std.testing.expectEqual(@as(u64, 3), metrics.total_queries);
+    try std.testing.expectEqual(@as(u64, 2), metrics.successful_queries);
+    try std.testing.expectEqual(@as(u64, 1), metrics.failed_queries);
+
+    // Success rate should be 2/3
+    const success_rate = metrics.getSuccessRate();
+    try std.testing.expect(success_rate > 0.66 and success_rate < 0.67);
+
+    // Average query time should be (100 + 200 + 50) / 3
+    const avg_time = metrics.getAverageQueryTime();
+    try std.testing.expect(avg_time > 116.6 and avg_time < 116.7);
+}
+
+test "date and time structures" {
+    const date = Date{ .year = 2023, .month = 12, .day = 25 };
+    try std.testing.expectEqual(@as(i32, 2023), date.year);
+    try std.testing.expectEqual(@as(u8, 12), date.month);
+    try std.testing.expectEqual(@as(u8, 25), date.day);
+
+    const time = Time{ .hour = 14, .minute = 30, .second = 45, .microsecond = 123456 };
+    try std.testing.expectEqual(@as(u8, 14), time.hour);
+    try std.testing.expectEqual(@as(u8, 30), time.minute);
+    try std.testing.expectEqual(@as(u8, 45), time.second);
+    try std.testing.expectEqual(@as(u32, 123456), time.microsecond);
+
+    const datetime = DateTime{ .date = date, .time = time };
+    try std.testing.expectEqual(date.year, datetime.date.year);
+    try std.testing.expectEqual(time.hour, datetime.time.hour);
+
+    const datetime_tz = DateTimeTz{ .datetime = datetime, .timezone_offset = -18000 }; // EST offset
+    try std.testing.expectEqual(@as(i32, -18000), datetime_tz.timezone_offset);
+}
+
+test "PgType union variants" {
+    // Test numeric types
+    const smallint_val = PgType{ .smallint = 42 };
+    const integer_val = PgType{ .integer = 12345 };
+    // const bigint_val = PgType{ .bigint = 9876543210 };
+    // const real_val = PgType{ .real = 3.14 };
+    // const double_val = PgType{ .double = 2.718281828 };
+
+    switch (smallint_val) {
+        .smallint => |val| try std.testing.expectEqual(@as(i16, 42), val),
+        else => try std.testing.expect(false),
+    }
+
+    switch (integer_val) {
+        .integer => |val| try std.testing.expectEqual(@as(i32, 12345), val),
+        else => try std.testing.expect(false),
+    }
+
+    // Test text types
+    const varchar_val = PgType{ .varchar = "hello" };
+    // const text_val = PgType{ .text = "world" };
+
+    switch (varchar_val) {
+        .varchar => |val| try std.testing.expectEqualStrings("hello", val),
+        else => try std.testing.expect(false),
+    }
+
+    // Test boolean type
+    const bool_val = PgType{ .boolean = true };
+    switch (bool_val) {
+        .boolean => |val| try std.testing.expectEqual(true, val),
+        else => try std.testing.expect(false),
+    }
+
+    // Test null type
+    const null_val = PgType{ .null = {} };
+    switch (null_val) {
+        .null => {},
+        else => try std.testing.expect(false),
+    }
+}
+
+test "SSL configuration" {
+    const ssl_config = SSLConfig{
+        .mode = .require,
+        .cert_file = "client.crt",
+        .key_file = "client.key",
+        .ca_file = "ca.crt",
+    };
+
+    try std.testing.expectEqual(@as(@TypeOf(ssl_config.mode), .require), ssl_config.mode);
+    try std.testing.expectEqualStrings("client.crt", ssl_config.cert_file.?);
+    try std.testing.expectEqualStrings("client.key", ssl_config.key_file.?);
+    try std.testing.expectEqualStrings("ca.crt", ssl_config.ca_file.?);
+}
+
+test "migration structure" {
+    const migration = Migration{
+        .version = 1,
+        .name = "create_users_table",
+        .up_sql = "CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT);",
+        .down_sql = "DROP TABLE users;",
+    };
+
+    try std.testing.expectEqual(@as(u32, 1), migration.version);
+    try std.testing.expectEqualStrings("create_users_table", migration.name);
+    try std.testing.expectEqualStrings("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT);", migration.up_sql);
+    try std.testing.expectEqualStrings("DROP TABLE users;", migration.down_sql);
+}
+
+// Integration tests (require a running PostgreSQL instance)
+test "full database integration" {
+    if (try std.process.hasEnvVar(std.testing.allocator, "SKIP_INTEGRATION_TESTS")) {
+        return;
+    }
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
+    const allocator = gpa.allocator();
+
+    var conn = Connection.init(allocator);
+    defer conn.deinit();
+
+    const db_host = get_db_host_env();
+    const connection_string = std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host}) catch "postgresql://postgres:postgres@localhost:5432";
+    defer allocator.free(connection_string);
+
+    try conn.connect(connection_string);
+
+    // Test basic query execution
+    try conn.exec("DROP TABLE IF EXISTS test_users", .{});
+    try conn.exec("CREATE TABLE test_users (id SERIAL PRIMARY KEY, name TEXT, age INTEGER, active BOOLEAN)", .{});
+
+    // Test insert operations
+    try conn.exec("INSERT INTO test_users (name, age, active) VALUES ('Alice', 25, true)", .{});
+    try conn.exec("INSERT INTO test_users (name, age, active) VALUES ('Bob', 30, false)", .{});
+
+    // Test select with ResultSet
+    var result = try conn.execSafe("SELECT id, name, age, active FROM test_users ORDER BY id");
+    try std.testing.expectEqual(@as(i32, 2), result.rowCount());
+    try std.testing.expectEqual(@as(i32, 4), result.columnCount());
+
+    // Test row iteration
+    var row_count: i32 = 0;
+    while (result.next()) |*row| {
+        row_count += 1;
+        const id = try row.get("id", i32);
+        const name = try row.get("name", []const u8);
+        const age = try row.get("age", i32);
+        const active = try row.get("active", bool);
+
+        if (row_count == 1) {
+            try std.testing.expectEqual(@as(i32, 1), id);
+            try std.testing.expectEqualStrings("Alice", name);
+            try std.testing.expectEqual(@as(i32, 25), age);
+            try std.testing.expectEqual(true, active);
+        } else if (row_count == 2) {
+            try std.testing.expectEqual(@as(i32, 2), id);
+            try std.testing.expectEqualStrings("Bob", name);
+            try std.testing.expectEqual(@as(i32, 30), age);
+            try std.testing.expectEqual(false, active);
+        }
+    }
+    try std.testing.expectEqual(@as(i32, 2), row_count);
+
+    // Clean up
+    try conn.exec("DROP TABLE test_users", .{});
+}
+
+test "prepared statements integration" {
+    if (try std.process.hasEnvVar(std.testing.allocator, "SKIP_INTEGRATION_TESTS")) {
+        return;
+    }
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
+    const allocator = gpa.allocator();
+
+    var conn = Connection.init(allocator);
+    defer conn.deinit();
+
+    const db_host = get_db_host_env();
+    const connection_string = std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host}) catch "postgresql://postgres:postgres@localhost:5432";
+    defer allocator.free(connection_string);
+
+    try conn.connect(connection_string);
+
+    // Setup test table
+    try conn.exec("DROP TABLE IF EXISTS test_prep", .{});
+    try conn.exec("CREATE TABLE test_prep (id SERIAL PRIMARY KEY, name TEXT, value INTEGER)", .{});
+
+    // Test prepared insert
+    try conn.prepare("insert_test", "INSERT INTO test_prep (name, value) VALUES ($1, $2)", &[_]u32{ 25, 23 }); // text, int4
+
+    _ = try conn.execPrepared("insert_test", &[_]?[]const u8{ "test1", "100" });
+    _ = try conn.execPrepared("insert_test", &[_]?[]const u8{ "test2", "200" });
+
+    // Test prepared select
+    try conn.prepare("select_by_name", "SELECT id, name, value FROM test_prep WHERE name = $1", &[_]u32{25}); // text
+
+    var result = try conn.execPrepared("select_by_name", &[_]?[]const u8{"test1"});
+    try std.testing.expectEqual(@as(i32, 1), result.rowCount());
+
+    if (result.next()) |row| {
+        const name = try row.get("name", []const u8);
+        const value = try row.get("value", i32);
+        try std.testing.expectEqualStrings("test1", name);
+        try std.testing.expectEqual(@as(i32, 100), value);
+    }
+
+    // Clean up
+    try conn.exec("DROP TABLE test_prep", .{});
+}
+
+test "transaction management integration" {
+    if (try std.process.hasEnvVar(std.testing.allocator, "SKIP_INTEGRATION_TESTS")) {
+        return;
+    }
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
+    const allocator = gpa.allocator();
+
+    var conn = Connection.init(allocator);
+    defer conn.deinit();
+
+    const db_host = get_db_host_env();
+    const connection_string = std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host}) catch "postgresql://postgres:postgres@localhost:5432";
+    defer allocator.free(connection_string);
+
+    try conn.connect(connection_string);
+
+    // Setup test table
+    try conn.exec("DROP TABLE IF EXISTS test_txn", .{});
+    try conn.exec("CREATE TABLE test_txn (id SERIAL PRIMARY KEY, value INTEGER)", .{});
+
+    // Test successful transaction
+    try conn.beginTransaction();
+    try conn.exec("INSERT INTO test_txn (value) VALUES (1)", .{});
+    try conn.exec("INSERT INTO test_txn (value) VALUES (2)", .{});
+    try conn.commit();
+
+    var result = try conn.execSafe("SELECT COUNT(*) as count FROM test_txn");
+    if (result.next()) |row| {
+        const count = try row.get("count", i64);
+        try std.testing.expectEqual(@as(i64, 2), count);
+    }
+
+    // Test rollback
+    try conn.beginTransaction();
+    try conn.exec("INSERT INTO test_txn (value) VALUES (3)", .{});
+    try conn.exec("INSERT INTO test_txn (value) VALUES (4)", .{});
+    try conn.rollback();
+
+    result = try conn.execSafe("SELECT COUNT(*) as count FROM test_txn");
+    if (result.next()) |row| {
+        const count = try row.get("count", i64);
+        try std.testing.expectEqual(@as(i64, 2), count); // Should still be 2
+    }
+
+    // Test savepoints
+    try conn.beginTransaction();
+    try conn.exec("INSERT INTO test_txn (value) VALUES (5)", .{});
+    try conn.savepoint("sp1");
+    try conn.exec("INSERT INTO test_txn (value) VALUES (6)", .{});
+    try conn.rollbackToSavepoint("sp1");
+    try conn.commit();
+
+    result = try conn.execSafe("SELECT COUNT(*) as count FROM test_txn");
+    if (result.next()) |row| {
+        const count = try row.get("count", i64);
+        try std.testing.expectEqual(@as(i64, 3), count); // Should be 3 (original 2 + 1 from savepoint test)
+    }
+
+    // Clean up
+    try conn.exec("DROP TABLE test_txn", .{});
+}
+
+test "connection pool integration" {
+    if (try std.process.hasEnvVar(std.testing.allocator, "SKIP_INTEGRATION_TESTS")) {
+        return;
+    }
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
+    const allocator = gpa.allocator();
+
+    const db_host = get_db_host_env();
+    const connection_string = std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host}) catch "postgresql://postgres:postgres@localhost:5432";
+    defer allocator.free(connection_string);
+
+    var pool = try ConnectionPool.init(allocator, connection_string, 2, 5);
+    defer pool.deinit();
+
+    // Test acquiring connections
+    const conn1 = try pool.acquire();
+    const conn2 = try pool.acquire();
+
+    // Test that connections work
+    try conn1.exec("SELECT 1", .{});
+    try conn2.exec("SELECT 2", .{});
+
+    // Test connection health
+    try std.testing.expect(conn1.ping());
+    try std.testing.expect(conn2.ping());
+
+    // Return connections to pool
+    pool.release(conn1);
+    pool.release(conn2);
+
+    // Test acquiring again (should reuse connections)
+    const conn3 = try pool.acquire();
+    const conn4 = try pool.acquire();
+
+    try std.testing.expect(conn3.ping());
+    try std.testing.expect(conn4.ping());
+
+    pool.release(conn3);
+    pool.release(conn4);
+}
+
+test "migration system integration" {
+    if (try std.process.hasEnvVar(std.testing.allocator, "SKIP_INTEGRATION_TESTS")) {
+        return;
+    }
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
+    const allocator = gpa.allocator();
+
+    var conn = Connection.init(allocator);
+    defer conn.deinit();
+
+    const db_host = get_db_host_env();
+    const connection_string = std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host}) catch "postgresql://postgres:postgres@localhost:5432";
+    defer allocator.free(connection_string);
+
+    try conn.connect(connection_string);
+
+    var runner = MigrationRunner.init(&conn, allocator);
+
+    // Ensure migration table exists
+    try runner.ensureMigrationTable();
+
+    // Create test migration
+    const migration = Migration{
+        .version = 1001,
+        .name = "test_migration",
+        .up_sql = "CREATE TABLE migration_test (id SERIAL PRIMARY KEY, data TEXT)",
+        .down_sql = "DROP TABLE migration_test",
+    };
+
+    // Apply migration
+    try runner.applyMigration(migration);
+
+    // Verify table was created
+    var result = try conn.execSafe("SELECT COUNT(*) as count FROM information_schema.tables WHERE table_name = 'migration_test'");
+    if (result.next()) |row| {
+        const count = try row.get("count", i64);
+        try std.testing.expectEqual(@as(i64, 1), count);
+    }
+
+    // Verify migration was recorded
+    result = try conn.execSafe("SELECT COUNT(*) as count FROM schema_migrations WHERE version = 1001");
+    if (result.next()) |row| {
+        const count = try row.get("count", i64);
+        try std.testing.expectEqual(@as(i64, 1), count);
+    }
+
+    // Test applying same migration again (should be skipped)
+    try runner.applyMigration(migration);
+
+    // Rollback migration
+    try runner.rollbackMigration(migration);
+
+    // Verify table was dropped
+    result = try conn.execSafe("SELECT COUNT(*) as count FROM information_schema.tables WHERE table_name = 'migration_test'");
+    if (result.next()) |row| {
+        const count = try row.get("count", i64);
+        try std.testing.expectEqual(@as(i64, 0), count);
+    }
+
+    // Verify migration record was removed
+    result = try conn.execSafe("SELECT COUNT(*) as count FROM schema_migrations WHERE version = 1001");
+    if (result.next()) |row| {
+        const count = try row.get("count", i64);
+        try std.testing.expectEqual(@as(i64, 0), count);
+    }
+}
+
+test "error handling integration" {
+    if (try std.process.hasEnvVar(std.testing.allocator, "SKIP_INTEGRATION_TESTS")) {
+        return;
+    }
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
+    const allocator = gpa.allocator();
+
+    var conn = Connection.init(allocator);
+    defer conn.deinit();
+
+    const db_host = get_db_host_env();
+    const connection_string = std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host}) catch "postgresql://postgres:postgres@localhost:5432";
+    defer allocator.free(connection_string);
+
+    try conn.connect(connection_string);
+
+    // Test query error
+    const result = conn.execSafe("SELECT * FROM nonexistent_table");
+    try std.testing.expectError(PostgresError.QueryFailed, result);
+
+    // Test detailed error info
+    const error_info = conn.getDetailedError();
+    try std.testing.expect(error_info.message.len > 0);
+    try std.testing.expect(error_info.sqlstate.len > 0);
+}
+
+test "null value handling integration" {
+    if (try std.process.hasEnvVar(std.testing.allocator, "SKIP_INTEGRATION_TESTS")) {
+        return;
+    }
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
+    const allocator = gpa.allocator();
+
+    var conn = Connection.init(allocator);
+    defer conn.deinit();
+
+    const db_host = get_db_host_env();
+    const connection_string = std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host}) catch "postgresql://postgres:postgres@localhost:5432";
+    defer allocator.free(connection_string);
+
+    try conn.connect(connection_string);
+
+    // Setup test table with nullable columns
+    try conn.exec("DROP TABLE IF EXISTS test_nulls", .{});
+    try conn.exec("CREATE TABLE test_nulls (id SERIAL PRIMARY KEY, name TEXT, age INTEGER)", .{});
+    try conn.exec("INSERT INTO test_nulls (name, age) VALUES ('Alice', 25)", .{});
+    try conn.exec("INSERT INTO test_nulls (name, age) VALUES (NULL, NULL)", .{});
+
+    var result = try conn.execSafe("SELECT id, name, age FROM test_nulls ORDER BY id");
+
+    // First row - non-null values
+    if (result.next()) |row| {
+        const name = try row.get("name", []const u8);
+        const age = try row.get("age", i32);
+        try std.testing.expectEqualStrings("Alice", name);
+        try std.testing.expectEqual(@as(i32, 25), age);
+
+        // Test optional access
+        const opt_name = try row.getOpt("name", []const u8);
+        const opt_age = try row.getOpt("age", i32);
+        try std.testing.expect(opt_name != null);
+        try std.testing.expect(opt_age != null);
+        try std.testing.expectEqualStrings("Alice", opt_name.?);
+        try std.testing.expectEqual(@as(i32, 25), opt_age.?);
+    }
+
+    // Second row - null values
+    if (result.next()) |row| {
+        // Test that accessing null values returns error
+        try std.testing.expectError(PostgresError.NullValue, row.get("name", []const u8));
+        try std.testing.expectError(PostgresError.NullValue, row.get("age", i32));
+
+        // Test optional access returns null
+        const opt_name = try row.getOpt("name", []const u8);
+        const opt_age = try row.getOpt("age", i32);
+        try std.testing.expect(opt_name == null);
+        try std.testing.expect(opt_age == null);
+    }
+
+    // Clean up
+    try conn.exec("DROP TABLE test_nulls", .{});
 }

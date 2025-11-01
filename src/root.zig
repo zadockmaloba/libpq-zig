@@ -545,19 +545,20 @@ pub const Connection = struct {
         try self.prepared_statements.put(try self.allocator.dupe(u8, name), {});
     }
 
-    pub fn execPrepared(self: *@This(), stmt_name: []const u8, params: []const ?[]const u8) !ResultSet {
+    pub fn execPrepared(self: *@This(), stmt_name: []const u8, params: []const []const u8) !ResultSet {
         if (self.pq == null) return PostgresError.ConnectionFailed;
 
         // Convert params to the format libpq expects
         var param_values: [][*c]const u8 = undefined;
         if (params.len > 0) {
-            param_values = try self.allocator.alloc([*c]const u8, params.len);
-            defer self.allocator.free(param_values);
+            param_values = try self.allocator.alloc([*c]const u8, params.len); 
 
             for (params, 0..) |param, i| {
-                param_values[i] = if (param) |p| p.ptr else null;
+                param_values[i] = param.ptr;
             }
         }
+        //TODO: Avoid an invalid free here
+        defer self.allocator.free(param_values);
 
         const result = libpq.PQexecPrepared(self.pq, stmt_name.ptr, @intCast(params.len), if (params.len > 0) param_values.ptr else null, null, // param lengths (null for text format)
             null, // param formats (null for text format)
@@ -915,7 +916,7 @@ pub const MigrationRunner = struct {
         const version_str = try std.fmt.allocPrint(self.allocator, "{d}", .{migration.version});
         defer self.allocator.free(version_str);
 
-        var result = try self.connection.execPrepared("check_migration", &[_]?[]const u8{version_str});
+        var result = try self.connection.execPrepared("check_migration", &.{version_str});
         if (result.rowCount() > 0) {
             try self.connection.rollback();
             std.log.info("Migration {d} already applied\n", .{migration.version});
@@ -928,7 +929,7 @@ pub const MigrationRunner = struct {
         // Record migration
         const insert_sql = "INSERT INTO schema_migrations (version, name) VALUES ($1, $2)";
         try self.connection.prepare("insert_migration", insert_sql, &[_]u32{ 23, 25 }); // int4, text
-        _ = try self.connection.execPrepared("insert_migration", &[_]?[]const u8{ version_str, migration.name });
+        _ = try self.connection.execPrepared("insert_migration", &.{ version_str, migration.name });
 
         try self.connection.commit();
         std.log.info("Applied migration {d}: {s}\n", .{ migration.version, migration.name });
@@ -948,7 +949,7 @@ pub const MigrationRunner = struct {
         const version_str = try std.fmt.allocPrint(self.allocator, "{d}", .{migration.version});
         defer self.allocator.free(version_str);
 
-        _ = try self.connection.execPrepared("delete_migration", &[_]?[]const u8{version_str});
+        _ = try self.connection.execPrepared("delete_migration", &.{version_str});
 
         try self.connection.commit();
         std.log.info("Rolled back migration {d}: {s}\n", .{ migration.version, migration.name });
@@ -997,7 +998,7 @@ pub const ConnectionMetrics = struct {
 
 test "simple libpq connection" {
     const db_host = get_db_host_env();
-    const connection_string = std.fmt.allocPrint(std.testing.allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host}) catch "postgresql://postgres:postgres@localhost:5432";
+    const connection_string = try std.fmt.allocPrint(std.testing.allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host});
     defer std.testing.allocator.free(connection_string);
 
     const conn = libpq.PQconnectdb(connection_string.ptr);
@@ -1023,7 +1024,7 @@ test "libpq wrapper API" {
     defer conn.deinit();
 
     const db_host = get_db_host_env();
-    const connection_string = std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host}) catch "postgresql://postgres:postgres@localhost:5432";
+    const connection_string = try std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host});
     defer allocator.free(connection_string);
 
     try conn.connect(connection_string);
@@ -1328,7 +1329,7 @@ test "full database integration" {
     defer conn.deinit();
 
     const db_host = get_db_host_env();
-    const connection_string = std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host}) catch "postgresql://postgres:postgres@localhost:5432";
+    const connection_string = try std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host});
     defer allocator.free(connection_string);
 
     try conn.connect(connection_string);
@@ -1386,7 +1387,7 @@ test "prepared statements integration" {
     defer conn.deinit();
 
     const db_host = get_db_host_env();
-    const connection_string = std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host}) catch "postgresql://postgres:postgres@localhost:5432";
+    const connection_string = try std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host});
     defer allocator.free(connection_string);
 
     try conn.connect(connection_string);
@@ -1396,15 +1397,15 @@ test "prepared statements integration" {
     try conn.exec("CREATE TABLE test_prep (id SERIAL PRIMARY KEY, name TEXT, value INTEGER)", .{});
 
     // Test prepared insert
-    try conn.prepare("insert_test", "INSERT INTO test_prep (name, value) VALUES ($1, $2)", &[_]u32{ 25, 23 }); // text, int4
+    try conn.prepare("insert_test", "INSERT INTO test_prep (name, value) VALUES ($1, $2)", &[_]u32{ 25, 23 }); // text, int4 
 
-    _ = try conn.execPrepared("insert_test", &[_]?[]const u8{ "test1", "100" });
-    _ = try conn.execPrepared("insert_test", &[_]?[]const u8{ "test2", "200" });
+    _ = try conn.execPrepared("insert_test", &.{ "test1", "100" });
+    _ = try conn.execPrepared("insert_test", &.{ "test2", "200" });
 
     // Test prepared select
     try conn.prepare("select_by_name", "SELECT id, name, value FROM test_prep WHERE name = $1", &[_]u32{25}); // text
 
-    var result = try conn.execPrepared("select_by_name", &[_]?[]const u8{"test1"});
+    var result = try conn.execPrepared("select_by_name", &.{"test1"});
     try std.testing.expectEqual(@as(i32, 1), result.rowCount());
 
     if (result.next()) |row| {
@@ -1431,7 +1432,7 @@ test "transaction management integration" {
     defer conn.deinit();
 
     const db_host = get_db_host_env();
-    const connection_string = std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host}) catch "postgresql://postgres:postgres@localhost:5432";
+    const connection_string = try std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host});
     defer allocator.free(connection_string);
 
     try conn.connect(connection_string);
@@ -1492,7 +1493,7 @@ test "connection pool integration" {
     const allocator = gpa.allocator();
 
     const db_host = get_db_host_env();
-    const connection_string = std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host}) catch "postgresql://postgres:postgres@localhost:5432";
+    const connection_string = try std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host});
     defer allocator.free(connection_string);
 
     var pool = try ConnectionPool.init(allocator, connection_string, 2, 5);
@@ -1538,7 +1539,7 @@ test "migration system integration" {
     defer conn.deinit();
 
     const db_host = get_db_host_env();
-    const connection_string = std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host}) catch "postgresql://postgres:postgres@localhost:5432";
+    const connection_string = try std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host});
     defer allocator.free(connection_string);
 
     try conn.connect(connection_string);
@@ -1607,7 +1608,7 @@ test "error handling integration" {
     defer conn.deinit();
 
     const db_host = get_db_host_env();
-    const connection_string = std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host}) catch "postgresql://postgres:postgres@localhost:5432";
+    const connection_string = try std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host});
     defer allocator.free(connection_string);
 
     try conn.connect(connection_string);
@@ -1635,7 +1636,7 @@ test "null value handling integration" {
     defer conn.deinit();
 
     const db_host = get_db_host_env();
-    const connection_string = std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host}) catch "postgresql://postgres:postgres@localhost:5432";
+    const connection_string = try std.fmt.allocPrint(allocator, "postgresql://postgres:postgres@{s}:5432", .{db_host});
     defer allocator.free(connection_string);
 
     try conn.connect(connection_string);

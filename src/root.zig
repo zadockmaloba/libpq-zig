@@ -542,7 +542,7 @@ pub const Connection = struct {
             return PostgresError.PreparedStatementFailed;
         }
 
-        try self.prepared_statements.put(try self.allocator.dupe(u8, name), {});
+        try self.prepared_statements.put(name, {});
     }
 
     pub fn execPrepared(self: *@This(), stmt_name: []const u8, params: []const []const u8) !ResultSet {

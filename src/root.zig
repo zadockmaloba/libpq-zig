@@ -453,9 +453,22 @@ pub const Connection = struct {
         }
     }
 
+    // Helper function to ensure null-terminated strings for C interop
+    fn ensureNullTerminated(self: *@This(), str: []const u8) ![:0]u8 {
+        // Always create a null-terminated copy to be safe
+        const null_term = try self.allocator.alloc(u8, str.len + 1);
+        @memcpy(null_term[0..str.len], str);
+        null_term[str.len] = 0;
+        return null_term[0..str.len :0];
+    }
+
     pub fn connect(self: *@This(), connString: []const u8) !void {
         std.log.info("DB Connection parameters: {s}\n", .{connString});
-        self.pq = libpq.PQconnectdb(@ptrCast(connString));
+
+        const null_term_conn_string = try self.ensureNullTerminated(connString);
+        defer self.allocator.free(null_term_conn_string);
+
+        self.pq = libpq.PQconnectdb(null_term_conn_string.ptr);
         const conn_status = libpq.PQstatus(self.pq);
 
         if (conn_status != libpq.CONNECTION_OK) {
@@ -497,7 +510,8 @@ pub const Connection = struct {
         @memset(self.format_buffer[0..], 0);
         const m_query = try std.fmt.bufPrint(&self.format_buffer, query, argv);
 
-        const result = libpq.PQexec(self.pq, @ptrCast(m_query));
+        // The format buffer is already null-initialized, so m_query should be null-terminated
+        const result = libpq.PQexec(self.pq, m_query.ptr);
         if (result == null) {
             std.log.err("Exec failed: {s}\n", .{libpq.PQerrorMessage(self.pq)});
             return PostgresError.QueryFailed;
@@ -508,7 +522,10 @@ pub const Connection = struct {
     pub fn execSafe(self: *@This(), query: []const u8) !ResultSet {
         if (self.pq == null) return PostgresError.ConnectionFailed;
 
-        const result = libpq.PQexec(self.pq, @ptrCast(query));
+        const null_term_query = try self.ensureNullTerminated(query);
+        defer self.allocator.free(null_term_query);
+
+        const result = libpq.PQexec(self.pq, null_term_query.ptr);
         if (result == null) {
             std.log.err("Exec failed: {s}\n", .{libpq.PQerrorMessage(self.pq)});
             return PostgresError.QueryFailed;
@@ -529,7 +546,13 @@ pub const Connection = struct {
     pub fn prepare(self: *@This(), name: []const u8, query: []const u8, param_types: []const u32) !void {
         if (self.pq == null) return PostgresError.ConnectionFailed;
 
-        const result = libpq.PQprepare(self.pq, name.ptr, query.ptr, @intCast(param_types.len), if (param_types.len > 0) param_types.ptr else null);
+        const null_term_name = try self.ensureNullTerminated(name);
+        defer self.allocator.free(null_term_name);
+
+        const null_term_query = try self.ensureNullTerminated(query);
+        defer self.allocator.free(null_term_query);
+
+        const result = libpq.PQprepare(self.pq, null_term_name.ptr, null_term_query.ptr, @intCast(param_types.len), if (param_types.len > 0) param_types.ptr else null);
 
         if (result == null) {
             return PostgresError.PreparedStatementFailed;
@@ -548,19 +571,33 @@ pub const Connection = struct {
     pub fn execPrepared(self: *@This(), stmt_name: []const u8, params: []const []const u8) !ResultSet {
         if (self.pq == null) return PostgresError.ConnectionFailed;
 
-        // Convert params to the format libpq expects
+        const null_term_stmt_name = try self.ensureNullTerminated(stmt_name);
+        defer self.allocator.free(null_term_stmt_name);
+
+        // Convert params to the format libpq expects (ensure they're null-terminated)
         var param_values: [][*c]const u8 = undefined;
+        var null_term_params: [][:0]u8 = undefined;
+
         if (params.len > 0) {
-            param_values = try self.allocator.alloc([*c]const u8, params.len); 
+            param_values = try self.allocator.alloc([*c]const u8, params.len);
+            null_term_params = try self.allocator.alloc([:0]u8, params.len);
 
             for (params, 0..) |param, i| {
-                param_values[i] = param.ptr;
+                null_term_params[i] = try self.ensureNullTerminated(param);
+                param_values[i] = null_term_params[i].ptr;
             }
         }
-        //TODO: Avoid an invalid free here
-        defer self.allocator.free(param_values);
+        defer {
+            if (params.len > 0) {
+                for (null_term_params) |null_term_param| {
+                    self.allocator.free(null_term_param);
+                }
+                self.allocator.free(null_term_params);
+                self.allocator.free(param_values);
+            }
+        }
 
-        const result = libpq.PQexecPrepared(self.pq, stmt_name.ptr, @intCast(params.len), if (params.len > 0) param_values.ptr else null, null, // param lengths (null for text format)
+        const result = libpq.PQexecPrepared(self.pq, null_term_stmt_name.ptr, @intCast(params.len), if (params.len > 0) param_values.ptr else null, null, // param lengths (null for text format)
             null, // param formats (null for text format)
             0 // result format (0 for text)
         );
@@ -625,7 +662,10 @@ pub const Connection = struct {
     pub fn execAsync(self: *@This(), query: []const u8) !void {
         if (self.pq == null) return PostgresError.ConnectionFailed;
 
-        const result = libpq.PQsendQuery(self.pq, query.ptr);
+        const null_term_query = try self.ensureNullTerminated(query);
+        defer self.allocator.free(null_term_query);
+
+        const result = libpq.PQsendQuery(self.pq, null_term_query.ptr);
         if (result != 1) {
             return PostgresError.QueryFailed;
         }
@@ -1397,7 +1437,7 @@ test "prepared statements integration" {
     try conn.exec("CREATE TABLE test_prep (id SERIAL PRIMARY KEY, name TEXT, value INTEGER)", .{});
 
     // Test prepared insert
-    try conn.prepare("insert_test", "INSERT INTO test_prep (name, value) VALUES ($1, $2)", &[_]u32{ 25, 23 }); // text, int4 
+    try conn.prepare("insert_test", "INSERT INTO test_prep (name, value) VALUES ($1, $2)", &[_]u32{ 25, 23 }); // text, int4
 
     _ = try conn.execPrepared("insert_test", &.{ "test1", "100" });
     _ = try conn.execPrepared("insert_test", &.{ "test2", "200" });

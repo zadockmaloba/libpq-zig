@@ -9,6 +9,15 @@ pub fn get_db_host_env() []const u8 {
     return std.process.getEnvVarOwned(std.heap.page_allocator, "DB_HOST") catch "localhost";
 }
 
+// Helper function to ensure null-terminated strings for C interop
+fn ensureNullTerminated(allocator: std.mem.Allocator, str: []const u8) ![:0]u8 {
+    // Always create a null-terminated copy to be safe
+    const null_term = try allocator.alloc(u8, str.len + 1);
+    @memcpy(null_term[0..str.len], str);
+    null_term[str.len] = 0;
+    return null_term[0..str.len :0];
+}
+
 const PostgresError = error{
     BufferInsertFailed,
     ConnectionFailed,
@@ -129,8 +138,11 @@ pub const Row = struct {
     result: *libpq.PGresult,
     row_index: i32,
 
-    pub fn get(self: *const @This(), column: []const u8, comptime T: type) !T {
-        const col_index = libpq.PQfnumber(self.result, column.ptr);
+    pub fn get(self: *const @This(), allocator: std.mem.Allocator, column: []const u8, comptime T: type) !T {
+        const col_str = try ensureNullTerminated(allocator, column);
+        defer allocator.free(col_str);
+
+        const col_index = libpq.PQfnumber(self.result, col_str);
         if (col_index == -1) return PostgresError.NoSuchColumn;
 
         if (libpq.PQgetisnull(self.result, self.row_index, col_index) == 1) {
@@ -141,8 +153,11 @@ pub const Row = struct {
         return parseValue(T, std.mem.span(value));
     }
 
-    pub fn getOpt(self: *const @This(), column: []const u8, comptime T: type) !?T {
-        const col_index = libpq.PQfnumber(self.result, column.ptr);
+    pub fn getOpt(self: *const @This(), allocator: std.mem.Allocator, column: []const u8, comptime T: type) !?T {
+        const col_str = try ensureNullTerminated(allocator, column);
+        defer allocator.free(col_str);
+
+        const col_index = libpq.PQfnumber(self.result, col_str);
         if (col_index == -1) return PostgresError.NoSuchColumn;
 
         if (libpq.PQgetisnull(self.result, self.row_index, col_index) == 1) {
@@ -447,21 +462,12 @@ pub const Connection = struct {
             libpq.PQfinish(self.pq);
             self.pq = null;
         }
-    }
-
-    // Helper function to ensure null-terminated strings for C interop
-    fn ensureNullTerminated(self: *@This(), str: []const u8) ![:0]u8 {
-        // Always create a null-terminated copy to be safe
-        const null_term = try self.allocator.alloc(u8, str.len + 1);
-        @memcpy(null_term[0..str.len], str);
-        null_term[str.len] = 0;
-        return null_term[0..str.len :0];
-    }
+    } 
 
     pub fn connect(self: *@This(), connString: []const u8) !void {
         std.log.info("DB Connection parameters: {s}\n", .{connString});
 
-        const null_term_conn_string = try self.ensureNullTerminated(connString);
+        const null_term_conn_string = try ensureNullTerminated(self.allocator, connString);
         defer self.allocator.free(null_term_conn_string);
 
         self.pq = libpq.PQconnectdb(null_term_conn_string.ptr);
@@ -518,7 +524,7 @@ pub const Connection = struct {
     pub fn execSafe(self: *@This(), query: []const u8) !ResultSet {
         if (self.pq == null) return PostgresError.ConnectionFailed;
 
-        const null_term_query = try self.ensureNullTerminated(query);
+        const null_term_query = try ensureNullTerminated(self.allocator, query);
         defer self.allocator.free(null_term_query);
 
         const result = libpq.PQexec(self.pq, null_term_query.ptr);
@@ -542,10 +548,10 @@ pub const Connection = struct {
     pub fn prepare(self: *@This(), name: []const u8, query: []const u8, param_types: []const u32) !void {
         if (self.pq == null) return PostgresError.ConnectionFailed;
 
-        const null_term_name = try self.ensureNullTerminated(name);
+        const null_term_name = try ensureNullTerminated(self.allocator, name);
         defer self.allocator.free(null_term_name);
 
-        const null_term_query = try self.ensureNullTerminated(query);
+        const null_term_query = try ensureNullTerminated(self.allocator, query);
         defer self.allocator.free(null_term_query);
 
         const result = libpq.PQprepare(self.pq, null_term_name.ptr, null_term_query.ptr, @intCast(param_types.len), if (param_types.len > 0) param_types.ptr else null);
@@ -567,7 +573,7 @@ pub const Connection = struct {
     pub fn execPrepared(self: *@This(), stmt_name: []const u8, params: []const []const u8) !ResultSet {
         if (self.pq == null) return PostgresError.ConnectionFailed;
 
-        const null_term_stmt_name = try self.ensureNullTerminated(stmt_name);
+        const null_term_stmt_name = try ensureNullTerminated(self.allocator, stmt_name);
         defer self.allocator.free(null_term_stmt_name);
 
         // Convert params to the format libpq expects (ensure they're null-terminated)
@@ -579,7 +585,7 @@ pub const Connection = struct {
             null_term_params = try self.allocator.alloc([:0]u8, params.len);
 
             for (params, 0..) |param, i| {
-                null_term_params[i] = try self.ensureNullTerminated(param);
+                null_term_params[i] = try ensureNullTerminated(self.allocator, param);
                 param_values[i] = null_term_params[i].ptr;
             }
         }
@@ -658,7 +664,7 @@ pub const Connection = struct {
     pub fn execAsync(self: *@This(), query: []const u8) !void {
         if (self.pq == null) return PostgresError.ConnectionFailed;
 
-        const null_term_query = try self.ensureNullTerminated(query);
+        const null_term_query = try ensureNullTerminated(self.allocator, query);
         defer self.allocator.free(null_term_query);
 
         const result = libpq.PQsendQuery(self.pq, null_term_query.ptr);
@@ -1387,10 +1393,10 @@ test "full database integration" {
     var row_count: i32 = 0;
     while (result.next()) |*row| {
         row_count += 1;
-        const id = try row.get("id", i32);
-        const name = try row.get("name", []const u8);
-        const age = try row.get("age", i32);
-        const active = try row.get("active", bool);
+        const id = try row.get(allocator, "id", i32);
+        const name = try row.get(allocator, "name", []const u8);
+        const age = try row.get(allocator, "age", i32);
+        const active = try row.get(allocator, "active", bool);
 
         if (row_count == 1) {
             try std.testing.expectEqual(@as(i32, 1), id);
@@ -1445,8 +1451,8 @@ test "prepared statements integration" {
     try std.testing.expectEqual(@as(i32, 1), result.rowCount());
 
     if (result.next()) |row| {
-        const name = try row.get("name", []const u8);
-        const value = try row.get("value", i32);
+        const name = try row.get(allocator, "name", []const u8);
+        const value = try row.get(allocator, "value", i32);
         try std.testing.expectEqualStrings("test1", name);
         try std.testing.expectEqual(@as(i32, 100), value);
     }
@@ -1485,7 +1491,7 @@ test "transaction management integration" {
 
     var result = try conn.execSafe("SELECT COUNT(*) as count FROM test_txn");
     if (result.next()) |row| {
-        const count = try row.get("count", i64);
+        const count = try row.get(allocator, "count", i64);
         try std.testing.expectEqual(@as(i64, 2), count);
     }
 
@@ -1497,7 +1503,7 @@ test "transaction management integration" {
 
     result = try conn.execSafe("SELECT COUNT(*) as count FROM test_txn");
     if (result.next()) |row| {
-        const count = try row.get("count", i64);
+        const count = try row.get(allocator, "count", i64);
         try std.testing.expectEqual(@as(i64, 2), count); // Should still be 2
     }
 
@@ -1511,7 +1517,7 @@ test "transaction management integration" {
 
     result = try conn.execSafe("SELECT COUNT(*) as count FROM test_txn");
     if (result.next()) |row| {
-        const count = try row.get("count", i64);
+        const count = try row.get(allocator, "count", i64);
         try std.testing.expectEqual(@as(i64, 3), count); // Should be 3 (original 2 + 1 from savepoint test)
     }
 
@@ -1599,14 +1605,14 @@ test "migration system integration" {
     // Verify table was created
     var result = try conn.execSafe("SELECT COUNT(*) as count FROM information_schema.tables WHERE table_name = 'migration_test'");
     if (result.next()) |row| {
-        const count = try row.get("count", i64);
+        const count = try row.get(allocator, "count", i64);
         try std.testing.expectEqual(@as(i64, 1), count);
     }
 
     // Verify migration was recorded
     result = try conn.execSafe("SELECT COUNT(*) as count FROM schema_migrations WHERE version = 1001");
     if (result.next()) |row| {
-        const count = try row.get("count", i64);
+        const count = try row.get(allocator, "count", i64);
         try std.testing.expectEqual(@as(i64, 1), count);
     }
 
@@ -1619,14 +1625,14 @@ test "migration system integration" {
     // Verify table was dropped
     result = try conn.execSafe("SELECT COUNT(*) as count FROM information_schema.tables WHERE table_name = 'migration_test'");
     if (result.next()) |row| {
-        const count = try row.get("count", i64);
+        const count = try row.get(allocator, "count", i64);
         try std.testing.expectEqual(@as(i64, 0), count);
     }
 
     // Verify migration record was removed
     result = try conn.execSafe("SELECT COUNT(*) as count FROM schema_migrations WHERE version = 1001");
     if (result.next()) |row| {
-        const count = try row.get("count", i64);
+        const count = try row.get(allocator, "count", i64);
         try std.testing.expectEqual(@as(i64, 0), count);
     }
 }
@@ -1687,14 +1693,14 @@ test "null value handling integration" {
 
     // First row - non-null values
     if (result.next()) |row| {
-        const name = try row.get("name", []const u8);
-        const age = try row.get("age", i32);
+        const name = try row.get(allocator, "name", []const u8);
+        const age = try row.get(allocator, "age", i32);
         try std.testing.expectEqualStrings("Alice", name);
         try std.testing.expectEqual(@as(i32, 25), age);
 
         // Test optional access
-        const opt_name = try row.getOpt("name", []const u8);
-        const opt_age = try row.getOpt("age", i32);
+        const opt_name = try row.getOpt(allocator, "name", []const u8);
+        const opt_age = try row.getOpt(allocator, "age", i32);
         try std.testing.expect(opt_name != null);
         try std.testing.expect(opt_age != null);
         try std.testing.expectEqualStrings("Alice", opt_name.?);
@@ -1704,12 +1710,12 @@ test "null value handling integration" {
     // Second row - null values
     if (result.next()) |row| {
         // Test that accessing null values returns error
-        try std.testing.expectError(PostgresError.NullValue, row.get("name", []const u8));
-        try std.testing.expectError(PostgresError.NullValue, row.get("age", i32));
+        try std.testing.expectError(PostgresError.NullValue, row.get(allocator, "name", []const u8));
+        try std.testing.expectError(PostgresError.NullValue, row.get(allocator, "age", i32));
 
         // Test optional access returns null
-        const opt_name = try row.getOpt("name", []const u8);
-        const opt_age = try row.getOpt("age", i32);
+        const opt_name = try row.getOpt(allocator, "name", []const u8);
+        const opt_age = try row.getOpt(allocator, "age", i32);
         try std.testing.expect(opt_name == null);
         try std.testing.expect(opt_age == null);
     }

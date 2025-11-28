@@ -1694,7 +1694,7 @@ test "null value handling integration" {
     try conn.exec("DROP TABLE IF EXISTS test_nulls", .{});
     try conn.exec("CREATE TABLE test_nulls (id SERIAL PRIMARY KEY, name TEXT, age INTEGER, createdAt TIMESTAMP DEFAULT NOW())", .{});
     try conn.exec("INSERT INTO test_nulls (name, age) VALUES ('Alice', 25)", .{});
-    try conn.exec("INSERT INTO test_nulls (name, age, \"createdAt\") VALUES (NULL, NULL, NULL)", .{});
+    try conn.exec("INSERT INTO test_nulls (name, age, createdAt) VALUES (NULL, NULL, NULL)", .{});
 
     var result = try conn.execSafe("SELECT * FROM test_nulls ORDER BY id");
     defer result.deinit();

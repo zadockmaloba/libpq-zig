@@ -8,13 +8,14 @@
             .url = "https://github.com/allyourcodebase/libpq/archive/refs/tags/5.16.4+4.zip",
             .hash = "libpq-5.16.4-QME6aW36AADOlwgzNjKYsIb6YAesA6R7OV_eP7S7JBqt",
         },
+        .zeit = .{
+            .url = "https://github.com/rockorager/zeit/archive/refs/tags/v0.7.0.zip",
+            .hash = "zeit-0.6.0-5I6bk7V8AgAY0-hM-vUYtKZUFYhXct-VRkqISNNTfEfb",
+        },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
-        // For example...
-        //"LICENSE",
-        //"README.md",
     },
 }

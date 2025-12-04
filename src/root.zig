@@ -1,8 +1,5 @@
 const std = @import("std");
-
-const libpq = @cImport({
-    @cInclude("libpq-fe.h");
-});
+const libpq = @import("libpq");
 
 pub fn get_db_host_env() []const u8 {
     // Check for environment variable, default to localhost for local development

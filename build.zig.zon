@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .libpq = .{
-            .url = "https://github.com/allyourcodebase/libpq/archive/refs/tags/5.16.4+4.zip",
-            .hash = "libpq-5.16.4-QME6aW36AADOlwgzNjKYsIb6YAesA6R7OV_eP7S7JBqt",
+            .url = "git+https://github.com/allyourcodebase/libpq?ref=master#58347f9385ce20797fabb2a345fb50e4a36ffbdb",
+            .hash = "libpq-5.16.4-QME6aREEAQAdfVrJ1Zx79PZtSpg41jRs-Jy3QGkWGOih",
         },
         .zeit = .{
             .url = "https://github.com/rockorager/zeit/archive/refs/tags/v0.7.0.zip",
